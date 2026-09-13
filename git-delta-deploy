@@ -1,0 +1,844 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage:
+  git-delta-deploy [options] <first-hop> <absolute-target-dir>
+
+Examples:
+  git-delta-deploy --dry-run deploy@target.example /srv/application
+  git-delta-deploy --include-branch-diff deploy@target.example /srv/application
+  git-delta-deploy --include-branch-diff=upstream/main deploy@target.example /srv/application
+  git-delta-deploy --via-target deploy@internal.example --via-port 2222 jump@example.net /srv/application
+  git-delta-deploy-via-password --via-target deploy@internal.example jump@example.net /srv/application
+
+Options:
+  --dry-run             Only show files that would be copied/deleted.
+  --verbose             Show full excluded/skipped file lists.
+  --include-untracked   Include non-ignored untracked files. By default, only
+                        paths already known to Git are candidates.
+  --no-delete           Do not remove locally deleted files from the target.
+  --no-verify           Skip remote checksum/deleted-file verification.
+  --include-branch-diff[=BASE_REF]
+                        Also deploy committed changes since the merge base.
+                        With no BASE_REF, resolve a default remote branch from
+                        local refs without contacting the network.
+  --exclude-file FILE   Exclude regex file.
+                        Default: <repository>/.git-delta-deploy.exclude
+  --no-exclude          Do not apply an exclude file.
+  --via-target USER@HOST
+                        Apply through a second SSH target reached from the
+                        first host.
+  --via-port PORT       Second-hop SSH port (default: 22).
+  -h, --help            Show this help.
+
+Notes:
+  TARGET_DIR must be absolute and must already exist on the final target.
+  Exclude patterns are regular expressions matched against repo-relative paths.
+  Blank lines and lines starting with # are ignored.
+  Repository paths containing newlines are unsupported.
+  Use git-delta-deploy-via-password for explicit second-hop password authentication.
+  The password is passed over SSH input and is not placed in command arguments.
+EOF
+}
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "ERROR: Run git-delta-deploy from inside a Git worktree." >&2
+  exit 1
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DEFAULT_EXCLUDE_FILE="$REPO_ROOT/.git-delta-deploy.exclude"
+
+DRY_RUN=0
+VERBOSE=0
+VERIFY=1
+DELETE_REMOTE=1
+USE_EXCLUDE=1
+EXCLUDE_FILE="$DEFAULT_EXCLUDE_FILE"
+INCLUDE_BRANCH_DIFF=0
+INCLUDE_UNTRACKED=0
+BASE_REF=""
+VIA_TARGET=""
+VIA_PORT=22
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --verbose)
+      VERBOSE=1
+      shift
+      ;;
+    --include-untracked)
+      INCLUDE_UNTRACKED=1
+      shift
+      ;;
+    --no-delete)
+      DELETE_REMOTE=0
+      shift
+      ;;
+    --no-verify)
+      VERIFY=0
+      shift
+      ;;
+    --include-branch-diff)
+      INCLUDE_BRANCH_DIFF=1
+      shift
+      ;;
+    --include-branch-diff=*)
+      INCLUDE_BRANCH_DIFF=1
+      BASE_REF="${1#*=}"
+      if [[ -z "$BASE_REF" ]]; then
+        echo "ERROR: --include-branch-diff requires a non-empty BASE_REF after '='" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --exclude-file)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --exclude-file requires a path" >&2
+        exit 2
+      fi
+      EXCLUDE_FILE="$2"
+      shift 2
+      ;;
+    --no-exclude)
+      USE_EXCLUDE=0
+      shift
+      ;;
+    --via-target)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --via-target requires USER@HOST" >&2
+        exit 2
+      fi
+      VIA_TARGET="$2"
+      shift 2
+      ;;
+    --via-port)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --via-port requires PORT" >&2
+        exit 2
+      fi
+      VIA_PORT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "ERROR: Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -ne 2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+NODE="$1"
+TARGET_DIR="$2"
+
+if [[ "$TARGET_DIR" != /* ]]; then
+  echo "ERROR: TARGET_DIR must be an absolute path: $TARGET_DIR" >&2
+  exit 2
+fi
+if [[ "$NODE" == *$'\n'* || "$TARGET_DIR" == *$'\n'* ]]; then
+  echo "ERROR: SSH targets and TARGET_DIR must not contain newlines." >&2
+  exit 2
+fi
+if [[ -n "$VIA_TARGET" && "$VIA_TARGET" == *$'\n'* ]]; then
+  echo "ERROR: --via-target must not contain a newline." >&2
+  exit 2
+fi
+if [[ ! "$VIA_PORT" =~ ^[0-9]+$ ]] || (( VIA_PORT < 1 || VIA_PORT > 65535 )); then
+  echo "ERROR: --via-port must be an integer from 1 to 65535: $VIA_PORT" >&2
+  exit 2
+fi
+if [[ -z "$VIA_TARGET" && "$VIA_PORT" -ne 22 ]]; then
+  echo "ERROR: --via-port requires --via-target." >&2
+  exit 2
+fi
+if [[ "${GIT_DELTA_DEPLOY_PASSWORD:-}" == *$'\n'* ]]; then
+  echo "ERROR: GIT_DELTA_DEPLOY_PASSWORD must not contain a newline." >&2
+  exit 2
+fi
+
+cd "$REPO_ROOT"
+
+resolve_default_base_ref() {
+  local upstream=""
+  local upstream_remote=""
+  local candidate=""
+  local ref=""
+  local -a candidates=()
+
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  if [[ "$upstream" == */* ]]; then
+    upstream_remote="${upstream%%/*}"
+    candidate="$(git symbolic-ref --quiet --short "refs/remotes/$upstream_remote/HEAD" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]] && git rev-parse --verify "${candidate}^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  candidate="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$candidate" ]] && git rev-parse --verify "${candidate}^{commit}" >/dev/null 2>&1; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  while IFS= read -r ref; do
+    candidate="$(git symbolic-ref --quiet --short "$ref" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]] && git rev-parse --verify "${candidate}^{commit}" >/dev/null 2>&1; then
+      candidates+=("$candidate")
+    fi
+  done < <(git for-each-ref --format='%(refname)' 'refs/remotes/*/HEAD')
+
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    printf '%s\n' "${candidates[0]}"
+    return 0
+  fi
+
+  return 1
+}
+
+BASE_COMMIT=""
+MERGE_BASE=""
+HEAD_COMMIT=""
+if [[ "$INCLUDE_BRANCH_DIFF" -eq 1 ]]; then
+  if [[ -z "$BASE_REF" ]]; then
+    if ! BASE_REF="$(resolve_default_base_ref)"; then
+      echo "ERROR: Cannot resolve a reliable default remote branch from local Git refs." >&2
+      echo "Specify --include-branch-diff=BASE_REF. No refs were fetched or updated." >&2
+      exit 2
+    fi
+  fi
+
+  if ! BASE_COMMIT="$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null)"; then
+    echo "ERROR: BASE_REF does not resolve to a local commit: $BASE_REF" >&2
+    echo "No refs were fetched or updated. Fetch the ref separately if needed." >&2
+    exit 2
+  fi
+
+  HEAD_COMMIT="$(git rev-parse --verify HEAD^{commit})"
+  if ! MERGE_BASE="$(git merge-base "$BASE_COMMIT" "$HEAD_COMMIT")"; then
+    echo "ERROR: No merge base found between BASE_REF '$BASE_REF' and HEAD." >&2
+    exit 2
+  fi
+fi
+
+TS="$(date +%Y%m%d-%H%M%S)"
+WORK="$(mktemp -d "/tmp/git-delta-deploy-${TS}.XXXXXX")"
+BUNDLE="$WORK/git-delta-deploy.tgz"
+MANIFEST_NAME=".git-delta-deploy-manifest"
+MANIFEST_DIR="$WORK/$MANIFEST_NAME"
+mkdir -p "$MANIFEST_DIR"
+REMOTE_STAGE=""
+
+cleanup() {
+  local status=$?
+
+  rm -rf -- "$WORK"
+  if [[ -n "$REMOTE_STAGE" ]]; then
+    ssh "$NODE" "rm -rf -- $REMOTE_STAGE" >/dev/null 2>&1 || true
+  fi
+
+  return "$status"
+}
+trap cleanup EXIT
+
+CHANGED_NUL="$WORK/changed-files.raw.nul"
+DELETED_NUL="$WORK/deleted-files.raw.nul"
+CHANGED_RAW="$MANIFEST_DIR/changed-files.raw.txt"
+DELETED_RAW="$MANIFEST_DIR/deleted-files.raw.txt"
+CHANGED="$MANIFEST_DIR/changed-files.txt"
+DELETED="$MANIFEST_DIR/deleted-files.txt"
+CHECKSUMS="$MANIFEST_DIR/changed-files.sha256"
+REGULAR_FILES="$MANIFEST_DIR/changed-regular-files.txt"
+SYMLINKS="$MANIFEST_DIR/changed-symlinks.txt"
+SKIPPED_CHANGED="$MANIFEST_DIR/skipped-changed-files.txt"
+SKIPPED_DELETED="$MANIFEST_DIR/skipped-deleted-files.txt"
+PRESERVED_DELETED="$MANIFEST_DIR/preserved-deleted-files.txt"
+
+: > "$CHANGED_NUL"
+: > "$DELETED_NUL"
+
+if [[ "$INCLUDE_BRANCH_DIFF" -eq 1 ]]; then
+  # Treat renames as an added/current path plus a deleted old path.
+  git diff --no-renames --name-only -z "$MERGE_BASE" "$HEAD_COMMIT" \
+    --diff-filter=ACMRTUXB >> "$CHANGED_NUL"
+fi
+
+# Tracked changed files: staged + unstaged, excluding deleted. Collecting the
+# two deltas separately also supports staged additions before the first commit.
+git diff --cached --no-renames --name-only -z --diff-filter=ACMRTUXB >> "$CHANGED_NUL"
+git diff --no-renames --name-only -z --diff-filter=ACMRTUXB >> "$CHANGED_NUL"
+
+# Optionally include untracked non-ignored files.
+if [[ "$INCLUDE_UNTRACKED" -eq 1 ]]; then
+  git ls-files --others --exclude-standard -z >> "$CHANGED_NUL"
+fi
+
+# Deleted tracked files.
+if [[ "$INCLUDE_BRANCH_DIFF" -eq 1 ]]; then
+  git diff --no-renames --name-only -z "$MERGE_BASE" "$HEAD_COMMIT" \
+    --diff-filter=D >> "$DELETED_NUL"
+fi
+git diff --cached --no-renames --name-only -z --diff-filter=D >> "$DELETED_NUL"
+git diff --no-renames --name-only -z --diff-filter=D >> "$DELETED_NUL"
+
+validate_repo_paths() {
+  local nul_file="$1"
+  local path
+
+  while IFS= read -r -d '' path; do
+    if [[ "$path" == *$'\n'* ]]; then
+      printf 'ERROR: Unsupported repository path contains a newline: %q\n' "$path" >&2
+      return 1
+    fi
+    if [[ -z "$path" || "$path" == /* ]]; then
+      printf 'ERROR: Repository candidate must be a relative path: %q\n' "$path" >&2
+      return 1
+    fi
+    case "/$path/" in
+      */../*|*/./*)
+        printf 'ERROR: Repository candidate contains a traversal component: %q\n' "$path" >&2
+        return 1
+        ;;
+    esac
+    if [[ "$path" == "$MANIFEST_NAME" || "$path" == "$MANIFEST_NAME"/* ]]; then
+      printf 'ERROR: Repository candidate uses reserved %s namespace: %q\n' "$MANIFEST_NAME" "$path" >&2
+      return 1
+    fi
+  done < "$nul_file"
+}
+
+validate_repo_paths "$CHANGED_NUL"
+validate_repo_paths "$DELETED_NUL"
+
+tr '\0' '\n' < "$CHANGED_NUL" > "$CHANGED_RAW"
+tr '\0' '\n' < "$DELETED_NUL" > "$DELETED_RAW"
+LC_ALL=C sort -u "$CHANGED_RAW" -o "$CHANGED_RAW"
+LC_ALL=C sort -u "$DELETED_RAW" -o "$DELETED_RAW"
+
+# If collection sources classify the same path differently, the current
+# worktree state wins.
+LC_ALL=C comm -12 "$CHANGED_RAW" "$DELETED_RAW" > "$WORK/conflicting-files.txt"
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  if [[ -e "$f" || -L "$f" ]]; then
+    grep -Fvx -- "$f" "$DELETED_RAW" > "$DELETED_RAW.tmp" || true
+    mv "$DELETED_RAW.tmp" "$DELETED_RAW"
+  else
+    grep -Fvx -- "$f" "$CHANGED_RAW" > "$CHANGED_RAW.tmp" || true
+    mv "$CHANGED_RAW.tmp" "$CHANGED_RAW"
+  fi
+done < "$WORK/conflicting-files.txt"
+
+# A path deleted by a branch delta can be restored as an ordinary worktree file.
+# It remains a Git-derived candidate, so current worktree state still wins even
+# when general untracked-file selection is disabled.
+cp "$DELETED_RAW" "$WORK/deleted-files-after-conflicts.txt"
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  if [[ -e "$f" || -L "$f" ]]; then
+    printf '%s\n' "$f" >> "$CHANGED_RAW"
+    grep -Fvx -- "$f" "$DELETED_RAW" > "$DELETED_RAW.tmp" || true
+    mv "$DELETED_RAW.tmp" "$DELETED_RAW"
+  fi
+done < "$WORK/deleted-files-after-conflicts.txt"
+LC_ALL=C sort -u "$CHANGED_RAW" -o "$CHANGED_RAW"
+
+# Working lists that will be filtered by exclude rules.
+cp "$CHANGED_RAW" "$CHANGED"
+cp "$DELETED_RAW" "$DELETED"
+
+apply_exclude_file() {
+  local list_file="$1"
+
+  if [[ "$USE_EXCLUDE" -ne 1 || ! -f "$EXCLUDE_FILE" ]]; then
+    return 0
+  fi
+
+  local clean_patterns="$WORK/exclude-patterns.txt"
+
+  grep -vE '^[[:space:]]*($|#)' "$EXCLUDE_FILE" > "$clean_patterns" || true
+
+  if [[ ! -s "$clean_patterns" ]]; then
+    return 0
+  fi
+
+  if grep -vE -f "$clean_patterns" "$list_file" > "$list_file.tmp"; then
+    :
+  else
+    local grep_status=$?
+    if [[ "$grep_status" -eq 1 ]]; then
+      : > "$list_file.tmp"
+    else
+      rm -f -- "$list_file.tmp"
+      echo "ERROR: Invalid exclude regex in $EXCLUDE_FILE" >&2
+      return "$grep_status"
+    fi
+  fi
+  mv "$list_file.tmp" "$list_file"
+}
+
+apply_exclude_file "$CHANGED"
+apply_exclude_file "$DELETED"
+
+# Show what changed locally but was skipped by exclude rules.
+if [[ "$USE_EXCLUDE" -eq 1 ]]; then
+  LC_ALL=C comm -23 "$CHANGED_RAW" "$CHANGED" > "$SKIPPED_CHANGED" || true
+  LC_ALL=C comm -23 "$DELETED_RAW" "$DELETED" > "$SKIPPED_DELETED" || true
+else
+  : > "$SKIPPED_CHANGED"
+  : > "$SKIPPED_DELETED"
+fi
+
+# With --no-delete, keep locally deleted files untouched on the target.
+: > "$PRESERVED_DELETED"
+if [[ "$DELETE_REMOTE" -eq 0 ]]; then
+  cp "$DELETED" "$PRESERVED_DELETED"
+  : > "$DELETED"
+fi
+
+CHANGED_COUNT="$(awk 'END { print NR }' "$CHANGED")"
+SKIPPED_CHANGED_COUNT="$(awk 'END { print NR }' "$SKIPPED_CHANGED")"
+DELETED_COUNT="$(awk 'END { print NR }' "$DELETED")"
+PRESERVED_DELETED_COUNT="$(awk 'END { print NR }' "$PRESERVED_DELETED")"
+SKIPPED_DELETED_COUNT="$(awk 'END { print NR }' "$SKIPPED_DELETED")"
+
+echo "Repo root:     $REPO_ROOT"
+echo "First hop:     $NODE"
+if [[ -n "$VIA_TARGET" ]]; then
+  echo "Transport:     second hop via $VIA_TARGET:$VIA_PORT"
+else
+  echo "Transport:     direct SSH"
+fi
+echo "Target dir:    $TARGET_DIR"
+if [[ "$INCLUDE_BRANCH_DIFF" -eq 1 ]]; then
+  echo "Branch diff:   enabled"
+  echo "Base ref:      $BASE_REF"
+  echo "Base commit:   $BASE_COMMIT"
+  echo "Merge base:    $MERGE_BASE"
+  echo "HEAD commit:   $HEAD_COMMIT"
+fi
+if [[ "$USE_EXCLUDE" -eq 1 && -f "$EXCLUDE_FILE" ]]; then
+  echo "Exclude file:  $EXCLUDE_FILE"
+elif [[ "$USE_EXCLUDE" -eq 1 ]]; then
+  echo "Exclude file:  none"
+else
+  echo "Exclude file:  disabled"
+fi
+echo "Bundle:        $BUNDLE"
+if [[ "$VERIFY" -eq 1 ]]; then
+  echo "Verification:  enabled"
+else
+  echo "Verification:  disabled"
+fi
+if [[ "$DELETE_REMOTE" -eq 1 ]]; then
+  echo "Remote delete: enabled"
+else
+  echo "Remote delete: disabled"
+fi
+if [[ "$INCLUDE_UNTRACKED" -eq 1 ]]; then
+  echo "Untracked:     included (non-ignored)"
+  CANDIDATE_DESCRIPTION="Tracked/staged and untracked files"
+else
+  echo "Untracked:     excluded"
+  CANDIDATE_DESCRIPTION="Tracked/staged files"
+fi
+echo
+
+echo "$CANDIDATE_DESCRIPTION to deploy ($CHANGED_COUNT):"
+if [[ -s "$CHANGED" ]]; then
+  sed 's/^/  + /' "$CHANGED"
+else
+  echo "  none"
+fi
+
+echo
+echo "$CANDIDATE_DESCRIPTION skipped by exclude file: $SKIPPED_CHANGED_COUNT"
+if [[ "$VERBOSE" -eq 1 && -s "$SKIPPED_CHANGED" ]]; then
+  sed 's/^/  x /' "$SKIPPED_CHANGED"
+elif [[ "$VERBOSE" -eq 1 ]]; then
+  echo "  none"
+elif [[ -s "$SKIPPED_CHANGED" ]]; then
+  echo "  use --verbose to show skipped files"
+fi
+
+echo
+echo "Deleted files to remove remotely ($DELETED_COUNT):"
+if [[ -s "$DELETED" ]]; then
+  sed 's/^/  - /' "$DELETED"
+else
+  echo "  none"
+fi
+
+echo
+echo "Deleted files preserved remotely ($PRESERVED_DELETED_COUNT):"
+if [[ -s "$PRESERVED_DELETED" ]]; then
+  sed 's/^/  = /' "$PRESERVED_DELETED"
+else
+  echo "  none"
+fi
+
+echo
+echo "Deleted files skipped by exclude file: $SKIPPED_DELETED_COUNT"
+if [[ "$VERBOSE" -eq 1 && -s "$SKIPPED_DELETED" ]]; then
+  sed 's/^/  x /' "$SKIPPED_DELETED"
+elif [[ "$VERBOSE" -eq 1 ]]; then
+  echo "  none"
+elif [[ -s "$SKIPPED_DELETED" ]]; then
+  echo "  use --verbose to show skipped files"
+fi
+
+echo
+if [[ ! -s "$CHANGED" && ! -s "$DELETED" ]]; then
+  echo "Nothing to deploy."
+  exit 0
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "Dry run only. Nothing copied."
+  exit 0
+fi
+
+echo "Creating checksum manifest: $CHECKSUMS"
+: > "$CHECKSUMS"
+: > "$REGULAR_FILES"
+: > "$SYMLINKS"
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  if [[ -L "$f" ]]; then
+    path_b64="$(printf '%s' "$f" | base64 | tr -d '\n')"
+    target_b64="$(readlink -n -- "$f" | base64 | tr -d '\n')"
+    printf '%s\t%s\n' "$path_b64" "$target_b64" >> "$SYMLINKS"
+  else
+    printf '%s\n' "$f" >> "$REGULAR_FILES"
+    sha256sum -- "$f" >> "$CHECKSUMS"
+  fi
+done < "$CHANGED"
+
+echo "Creating bundle..."
+tar --verbatim-files-from -czf "$BUNDLE" \
+  -T "$CHANGED" \
+  -C "$WORK" "$MANIFEST_NAME"
+
+write_remote_apply_script() {
+  cat <<'REMOTE_SCRIPT'
+set -euo pipefail
+umask 077
+
+cleanup_remote() {
+  rm -rf -- "$REMOTE_STAGE"
+  if [[ -n "${BACKUP:-}" && "${BACKUP_READY:-0}" -ne 1 ]]; then
+    rm -f -- "$BACKUP"
+  fi
+}
+trap cleanup_remote EXIT
+
+TARGET_DIR="$(printf '%s' "$TARGET_DIR_B64" | base64 --decode)"
+BUNDLE="$REMOTE_STAGE/bundle.tgz"
+MANIFEST_NAME=".git-delta-deploy-manifest"
+MANIFEST_DIR="$REMOTE_STAGE/$MANIFEST_NAME"
+
+if [[ "$TARGET_DIR" != /* ]]; then
+  echo "ERROR: TARGET_DIR must be an absolute path: $TARGET_DIR" >&2
+  exit 2
+fi
+
+if ! TARGET_ROOT="$(realpath -e -- "$TARGET_DIR" 2>/dev/null)" || [[ ! -d "$TARGET_ROOT" ]]; then
+  echo "ERROR: Target dir does not exist: $TARGET_DIR" >&2
+  exit 1
+fi
+
+TARGET_DIR="$TARGET_ROOT"
+cd "$TARGET_ROOT"
+
+BACKUP=""
+BACKUP_READY=0
+BACKUP_LIST="$REMOTE_STAGE/backup-files.txt"
+CHANGED_FILE="$MANIFEST_DIR/changed-files.txt"
+DELETED_FILE="$MANIFEST_DIR/deleted-files.txt"
+REGULAR_FILE="$MANIFEST_DIR/changed-regular-files.txt"
+SYMLINK_FILE="$MANIFEST_DIR/changed-symlinks.txt"
+
+echo "Target dir: $TARGET_DIR"
+echo "Bundle:     $BUNDLE"
+
+echo "Extracting deployment manifests into private staging..."
+tar --no-same-owner -xzf "$BUNDLE" -C "$REMOTE_STAGE" "$MANIFEST_NAME"
+
+confine_candidate_path() {
+  local path="$1"
+  local parent_rel
+  local resolved_parent
+
+  if [[ -z "$path" || "$path" == /* || "$path" == *$'\n'* ]]; then
+    printf 'ERROR: Deployment candidate must be a repository-relative path: %q\n' "$path" >&2
+    return 1
+  fi
+  case "/$path/" in
+    */../*|*/./*)
+      printf 'ERROR: Deployment candidate contains a traversal component: %q\n' "$path" >&2
+      return 1
+      ;;
+  esac
+  if [[ "$path" == "$MANIFEST_NAME" || "$path" == "$MANIFEST_NAME"/* ]]; then
+    printf 'ERROR: Deployment candidate uses reserved %s namespace: %q\n' "$MANIFEST_NAME" "$path" >&2
+    return 1
+  fi
+
+  if [[ "$path" == */* ]]; then
+    parent_rel="${path%/*}"
+    if ! resolved_parent="$(realpath -m -- "$TARGET_ROOT/$parent_rel")"; then
+      printf 'ERROR: Cannot resolve deployment candidate parent: %q\n' "$path" >&2
+      return 1
+    fi
+  else
+    resolved_parent="$TARGET_ROOT"
+  fi
+
+  if [[ "$TARGET_ROOT" != "/" &&
+        "$resolved_parent" != "$TARGET_ROOT" &&
+        "$resolved_parent" != "$TARGET_ROOT/"* ]]; then
+    printf 'ERROR: Deployment candidate escapes target root through its parent: %q\n' "$path" >&2
+    return 1
+  fi
+
+  CONFINED_PATH="${resolved_parent%/}/${path##*/}"
+}
+
+validate_candidate_list() {
+  local list_file="$1"
+  local path
+
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    confine_candidate_path "$path"
+  done < "$list_file"
+}
+
+validate_candidate_list "$CHANGED_FILE"
+validate_candidate_list "$DELETED_FILE"
+
+echo "Preparing backup list..."
+{
+  cat "$CHANGED_FILE"
+  cat "$DELETED_FILE"
+} | LC_ALL=C sort -u | while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  confine_candidate_path "$f"
+  if [[ -e "$CONFINED_PATH" || -L "$CONFINED_PATH" ]]; then
+    printf '%s\n' "$f"
+  fi
+done > "$BACKUP_LIST"
+
+if [[ -s "$BACKUP_LIST" ]]; then
+  BACKUP="$(mktemp '/tmp/git-delta-deploy-backup.XXXXXX.tgz')"
+  echo "Creating backup: $BACKUP"
+  tar --verbatim-files-from -czf "$BACKUP" -C "$TARGET_DIR" -T "$BACKUP_LIST"
+  BACKUP_READY=1
+else
+  echo "No existing files to backup."
+fi
+
+echo "Extracting changed files..."
+if [[ -s "$CHANGED_FILE" ]]; then
+  validate_candidate_list "$CHANGED_FILE"
+  tar --verbatim-files-from --no-same-owner --same-permissions -xzf "$BUNDLE" \
+    -C "$TARGET_ROOT" -T "$CHANGED_FILE"
+else
+  echo "No changed files to extract."
+fi
+
+if [[ -s "$DELETED_FILE" ]]; then
+  echo "Removing deleted files on target..."
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    confine_candidate_path "$f"
+    echo "  rm -f $CONFINED_PATH"
+    rm -f -- "$CONFINED_PATH"
+  done < "$DELETED_FILE"
+else
+  echo "No deleted files to remove."
+fi
+
+if [[ "$VERIFY" -eq 1 ]]; then
+  echo "Verifying deployed file checksums..."
+  if [[ -s "$MANIFEST_DIR/changed-files.sha256" ]]; then
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      confine_candidate_path "$f"
+      if [[ ! -f "$CONFINED_PATH" || -L "$CONFINED_PATH" ]]; then
+        echo "ERROR: Expected regular file: $CONFINED_PATH" >&2
+        exit 1
+      fi
+    done < "$REGULAR_FILE"
+    sha256sum -c "$MANIFEST_DIR/changed-files.sha256"
+  else
+    echo "No changed regular files to verify."
+  fi
+
+  echo "Verifying deployed symlinks..."
+  if [[ -s "$SYMLINK_FILE" ]]; then
+    while IFS=$'\t' read -r path_b64 expected_target_b64 extra; do
+      if [[ -z "$path_b64" || -z "$expected_target_b64" || -n "$extra" ]]; then
+        echo "ERROR: Invalid symlink manifest entry." >&2
+        exit 1
+      fi
+      if ! f="$(printf '%s' "$path_b64" | base64 --decode)"; then
+        echo "ERROR: Invalid symlink path encoding." >&2
+        exit 1
+      fi
+      confine_candidate_path "$f"
+      if [[ ! -L "$CONFINED_PATH" ]]; then
+        echo "ERROR: Expected symlink: $CONFINED_PATH" >&2
+        exit 1
+      fi
+      actual_target_b64="$(readlink -n -- "$CONFINED_PATH" | base64 | tr -d '\n')"
+      if [[ "$actual_target_b64" != "$expected_target_b64" ]]; then
+        echo "ERROR: Symlink target differs: $CONFINED_PATH" >&2
+        exit 1
+      fi
+      echo "$f: symlink OK"
+    done < "$SYMLINK_FILE"
+  else
+    echo "No changed symlinks to verify."
+  fi
+
+  if [[ -s "$DELETED_FILE" ]]; then
+    echo "Verifying deleted files are absent..."
+    deletion_verify_failed=0
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      confine_candidate_path "$f"
+      if [[ -e "$CONFINED_PATH" || -L "$CONFINED_PATH" ]]; then
+        echo "ERROR: Deleted file still exists: $CONFINED_PATH" >&2
+        deletion_verify_failed=1
+      fi
+    done < "$DELETED_FILE"
+
+    if [[ "$deletion_verify_failed" -ne 0 ]]; then
+      exit 1
+    fi
+  else
+    echo "No deleted files to verify."
+  fi
+else
+  echo "Target verification skipped (--no-verify)."
+fi
+
+echo
+echo "Deployment complete."
+if [[ -s "$BACKUP_LIST" ]]; then
+  echo "Backup: $BACKUP"
+fi
+REMOTE_SCRIPT
+}
+
+APPLY_SCRIPT="$WORK/apply.sh"
+write_remote_apply_script > "$APPLY_SCRIPT"
+TARGET_DIR_B64="$(printf '%s' "$TARGET_DIR" | base64 | tr -d '\n')"
+
+echo "Creating private staging directory on first hop..."
+REMOTE_STAGE_CANDIDATE="$(ssh "$NODE" 'umask 077; mktemp -d /tmp/git-delta-deploy.XXXXXX')"
+if [[ ! "$REMOTE_STAGE_CANDIDATE" =~ ^/tmp/git-delta-deploy\.[[:alnum:]]+$ ]]; then
+  echo "ERROR: Remote mktemp returned an unexpected staging path: $REMOTE_STAGE_CANDIDATE" >&2
+  exit 1
+fi
+REMOTE_STAGE="$REMOTE_STAGE_CANDIDATE"
+
+echo "Copying bundle and apply script to first-hop staging..."
+scp "$BUNDLE" "$NODE:$REMOTE_STAGE/bundle.tgz"
+scp "$APPLY_SCRIPT" "$NODE:$REMOTE_STAGE/apply.sh"
+
+if [[ -n "$VIA_TARGET" ]]; then
+  VIA_TARGET_B64="$(printf '%s' "$VIA_TARGET" | base64 | tr -d '\n')"
+  OUTER_DRIVER="$WORK/second-hop-driver.sh"
+  cat > "$OUTER_DRIVER" <<'OUTER_SCRIPT'
+set -euo pipefail
+umask 077
+
+export LC_ALL=C
+export LANG=C
+
+VIA_TARGET="$(printf '%s' "$VIA_TARGET_B64" | base64 --decode)"
+VIA_STAGE=""
+via_ssh=(ssh -n -p "$VIA_PORT" "$VIA_TARGET")
+via_scp=(scp -P "$VIA_PORT")
+
+if [[ "$AUTH_MODE" == "password" ]]; then
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "ERROR: sshpass is required on the first hop when GIT_DELTA_DEPLOY_PASSWORD is set." >&2
+    exit 1
+  fi
+  via_ssh=(sshpass -e "${via_ssh[@]}")
+  via_scp=(sshpass -e "${via_scp[@]}")
+fi
+
+cleanup_outer() {
+  local status=$?
+  if [[ -n "$VIA_STAGE" ]]; then
+    "${via_ssh[@]}" "rm -rf -- $VIA_STAGE" >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$OUTER_STAGE"
+  return "$status"
+}
+trap cleanup_outer EXIT
+
+VIA_STAGE_CANDIDATE="$("${via_ssh[@]}" 'umask 077; mktemp -d /tmp/git-delta-deploy.XXXXXX')"
+if [[ ! "$VIA_STAGE_CANDIDATE" =~ ^/tmp/git-delta-deploy\.[[:alnum:]]+$ ]]; then
+  echo "ERROR: Second-hop mktemp returned an unexpected staging path: $VIA_STAGE_CANDIDATE" >&2
+  exit 1
+fi
+VIA_STAGE="$VIA_STAGE_CANDIDATE"
+
+"${via_scp[@]}" "$OUTER_STAGE/bundle.tgz" \
+  "$OUTER_STAGE/apply.sh" "$VIA_TARGET:$VIA_STAGE/" </dev/null
+"${via_ssh[@]}" \
+  "REMOTE_STAGE=$VIA_STAGE TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash $VIA_STAGE/apply.sh"
+VIA_STAGE=""
+OUTER_SCRIPT
+
+  echo "Applying bundle through second hop $VIA_TARGET:$VIA_PORT..."
+  if [[ -n "${GIT_DELTA_DEPLOY_PASSWORD:-}" ]]; then
+    {
+      printf 'password\n%s\n' "$GIT_DELTA_DEPLOY_PASSWORD"
+      cat "$OUTER_DRIVER"
+    } | ssh "$NODE" \
+      "OUTER_STAGE=$REMOTE_STAGE VIA_TARGET_B64=$VIA_TARGET_B64 VIA_PORT=$VIA_PORT TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash -c 'IFS= read -r AUTH_MODE; export AUTH_MODE; IFS= read -r SSHPASS; export SSHPASS; bash -s'"
+  else
+    {
+      printf 'normal\n'
+      cat "$OUTER_DRIVER"
+    } | ssh "$NODE" \
+      "OUTER_STAGE=$REMOTE_STAGE VIA_TARGET_B64=$VIA_TARGET_B64 VIA_PORT=$VIA_PORT TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash -c 'IFS= read -r AUTH_MODE; export AUTH_MODE; unset SSHPASS; bash -s'"
+  fi
+else
+  echo "Applying bundle on first-hop target..."
+  ssh "$NODE" \
+    "REMOTE_STAGE=$REMOTE_STAGE TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash $REMOTE_STAGE/apply.sh"
+fi
+REMOTE_STAGE=""
+
+echo
+echo "Deployment and verification completed successfully."
