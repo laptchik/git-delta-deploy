@@ -32,6 +32,8 @@ Options:
                         Apply through a second SSH target reached from the
                         first host.
   --via-port PORT       Second-hop SSH port (default: 22).
+  --container-password PASSWORD
+                        Password for nested SSH to --via-target only.
   -h, --help            Show this help.
 
 Notes:
@@ -39,8 +41,9 @@ Notes:
   Exclude patterns are regular expressions matched against repo-relative paths.
   Blank lines and lines starting with # are ignored.
   Repository paths containing newlines are unsupported.
-  Use git-delta-deploy-via-password for explicit second-hop password authentication.
-  The password is passed over SSH input and is not placed in command arguments.
+  There is no password option for first-hop authentication.
+  Use --container-password or git-delta-deploy-via-password for explicit
+  second-hop password authentication.
 EOF
 }
 
@@ -63,6 +66,7 @@ INCLUDE_UNTRACKED=0
 BASE_REF=""
 VIA_TARGET=""
 VIA_PORT=22
+CONTAINER_PASSWORD_SET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -127,6 +131,19 @@ while [[ $# -gt 0 ]]; do
       VIA_PORT="$2"
       shift 2
       ;;
+    --container-password)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --container-password requires PASSWORD" >&2
+        exit 2
+      fi
+      if [[ -z "$2" ]]; then
+        echo "ERROR: --container-password requires a non-empty PASSWORD" >&2
+        exit 2
+      fi
+      GIT_DELTA_DEPLOY_PASSWORD="$2"
+      CONTAINER_PASSWORD_SET=1
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -172,6 +189,10 @@ if [[ ! "$VIA_PORT" =~ ^[0-9]+$ ]] || (( VIA_PORT < 1 || VIA_PORT > 65535 )); th
 fi
 if [[ -z "$VIA_TARGET" && "$VIA_PORT" -ne 22 ]]; then
   echo "ERROR: --via-port requires --via-target." >&2
+  exit 2
+fi
+if [[ -z "$VIA_TARGET" && "$CONTAINER_PASSWORD_SET" -eq 1 ]]; then
+  echo "ERROR: --container-password requires --via-target." >&2
   exit 2
 fi
 if [[ "${GIT_DELTA_DEPLOY_PASSWORD:-}" == *$'\n'* ]]; then

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL="$ROOT/git-delta-deploy"
 PASSWORD_LAUNCHER="$ROOT/git-delta-deploy-via-password"
+INSTALLER="$ROOT/install.sh"
 TEST_ROOT="$(mktemp -d /tmp/git-delta-deploy-tests.XXXXXX)"
 PASS_COUNT=0
 
@@ -108,6 +109,21 @@ EOF
   assert_not_contains "$output" 'Second-hop SSH password:'
 
   pass 'password launcher forwards arguments, scopes a hidden password, and reports a missing main executable'
+}
+
+test_installation() {
+  local bin="$TEST_ROOT/install-bin"
+  local output="$TEST_ROOT/install.out"
+
+  "$INSTALLER" "$bin" >"$output" 2>&1
+  [[ -x "$bin/git-delta-deploy" ]] || fail 'installer did not install git-delta-deploy'
+  [[ -x "$bin/git-delta-deploy-via-password" ]] || fail 'installer did not install password launcher'
+  cmp -s "$TOOL" "$bin/git-delta-deploy" || fail 'installed main command differs from source'
+  cmp -s "$PASSWORD_LAUNCHER" "$bin/git-delta-deploy-via-password" || fail 'installed password launcher differs from source'
+  PATH="$bin:$PATH" command -v git-delta-deploy >/dev/null || fail 'installed main command is not PATH-visible'
+  PATH="$bin:$PATH" command -v git-delta-deploy-via-password >/dev/null || fail 'installed password launcher is not PATH-visible'
+  assert_contains "$output" "Installed git-delta-deploy and git-delta-deploy-via-password in $bin"
+  pass 'lightweight installer installs both executable commands into PATH'
 }
 
 test_selection_and_dry_run() {
@@ -217,6 +233,14 @@ test_branch_diff() {
   run_in_repo "$repo" "$output" --dry-run --include-branch-diff=origin/main host.example /srv/app
   assert_contains "$output" 'Base ref:      origin/main'
   assert_contains "$output" '  + branch-only.txt'
+
+  printf 'staged worktree change\n' >> "$repo/changed.txt"
+  git -C "$repo" add changed.txt
+  printf 'unstaged worktree change\n' >> "$repo/kept.txt"
+  run_in_repo "$repo" "$output" --dry-run --include-branch-diff=origin/main host.example /srv/app
+  assert_contains "$output" '  + branch-only.txt'
+  assert_contains "$output" '  + changed.txt'
+  assert_contains "$output" '  + kept.txt'
 
   run_in_repo "$repo" "$output" --dry-run --include-branch-diff host.example /srv/app
   assert_contains "$output" 'Base ref:      origin/main'
@@ -346,6 +370,25 @@ test_transport_control_flow() {
   assert_not_contains "$capture" 'UserKnownHostsFile=/dev/null'
   assert_contains "$output" 'Deployment and verification completed successfully.'
   assert_not_contains "$output" 'Done.'
+
+  : > "$log"
+  (cd "$repo" && PATH="$bin:$PATH" TRANSPORT_LOG="$log" OUTER_CAPTURE="$capture" \
+    "$TOOL" --via-target root@localhost --via-port 2222 \
+      --container-password 'container secret' first@example /srv/app) >"$output" 2>&1
+  assert_contains "$log" 'ssh: <first@example> <umask 077; mktemp -d /tmp/git-delta-deploy.XXXXXX>'
+  assert_not_contains "$log" 'container secret'
+  assert_contains "$capture" 'password'
+  assert_contains "$capture" 'container secret'
+  assert_contains "$capture" 'via_ssh=(sshpass -e "${via_ssh[@]}")'
+  assert_contains "$output" 'Deployment and verification completed successfully.'
+
+  : > "$log"
+  if (cd "$repo" && PATH="$bin:$PATH" TRANSPORT_LOG="$log" OUTER_CAPTURE="$capture" \
+      "$TOOL" --container-password 'container secret' first@example /srv/app) >"$output" 2>&1; then
+    fail '--container-password succeeded without --via-target'
+  fi
+  assert_contains "$output" 'ERROR: --container-password requires --via-target.'
+  [[ ! -s "$log" ]] || fail '--container-password validation invoked an SSH transport command'
   pass 'direct first-hop flow and second-hop stdin-isolated apply flow'
 }
 
@@ -661,6 +704,7 @@ if [[ "${1:-}" == --symlink-only ]]; then
 fi
 
 test_password_launcher
+test_installation
 test_selection_and_dry_run
 test_verbose_excludes_and_no_delete
 test_explicit_target_validation
