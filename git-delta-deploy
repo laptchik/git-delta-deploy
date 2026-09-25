@@ -32,6 +32,8 @@ Options:
                         Apply through a second SSH target reached from the
                         first host.
   --via-port PORT       Second-hop SSH port (default: 22).
+  --via-accept-new-host-key
+                        Accept and store previously unseen second-hop host keys.
   --container-password PASSWORD
                         Password for nested SSH to --via-target only.
   -h, --help            Show this help.
@@ -66,6 +68,7 @@ INCLUDE_UNTRACKED=0
 BASE_REF=""
 VIA_TARGET=""
 VIA_PORT=22
+VIA_ACCEPT_NEW_HOST_KEY=0
 CONTAINER_PASSWORD_SET=0
 
 while [[ $# -gt 0 ]]; do
@@ -131,6 +134,10 @@ while [[ $# -gt 0 ]]; do
       VIA_PORT="$2"
       shift 2
       ;;
+    --via-accept-new-host-key)
+      VIA_ACCEPT_NEW_HOST_KEY=1
+      shift
+      ;;
     --container-password)
       if [[ $# -lt 2 ]]; then
         echo "ERROR: --container-password requires PASSWORD" >&2
@@ -189,6 +196,10 @@ if [[ ! "$VIA_PORT" =~ ^[0-9]+$ ]] || (( VIA_PORT < 1 || VIA_PORT > 65535 )); th
 fi
 if [[ -z "$VIA_TARGET" && "$VIA_PORT" -ne 22 ]]; then
   echo "ERROR: --via-port requires --via-target." >&2
+  exit 2
+fi
+if [[ -z "$VIA_TARGET" && "$VIA_ACCEPT_NEW_HOST_KEY" -eq 1 ]]; then
+  echo "ERROR: --via-accept-new-host-key requires --via-target." >&2
   exit 2
 fi
 if [[ -z "$VIA_TARGET" && "$CONTAINER_PASSWORD_SET" -eq 1 ]]; then
@@ -804,8 +815,12 @@ export LANG=C
 
 VIA_TARGET="$(printf '%s' "$VIA_TARGET_B64" | base64 --decode)"
 VIA_STAGE=""
-via_ssh=(ssh -n -p "$VIA_PORT" "$VIA_TARGET")
-via_scp=(scp -P "$VIA_PORT")
+via_host_key_options=()
+if [[ "$VIA_ACCEPT_NEW_HOST_KEY" -eq 1 ]]; then
+  via_host_key_options=(-o StrictHostKeyChecking=accept-new)
+fi
+via_ssh=(ssh -n -p "$VIA_PORT" "${via_host_key_options[@]}" "$VIA_TARGET")
+via_scp=(scp -P "$VIA_PORT" "${via_host_key_options[@]}")
 
 if [[ "$AUTH_MODE" == "password" ]]; then
   if ! command -v sshpass >/dev/null 2>&1; then
@@ -815,6 +830,28 @@ if [[ "$AUTH_MODE" == "password" ]]; then
   via_ssh=(sshpass -e "${via_ssh[@]}")
   via_scp=(sshpass -e "${via_scp[@]}")
 fi
+
+report_second_hop_failure() {
+  local phase="$1"
+  local status="$2"
+
+  echo "ERROR: Second-hop transport failed while $phase (exit status $status)." >&2
+  if [[ "$AUTH_MODE" == "password" ]]; then
+    case "$status" in
+      6)
+        echo "ERROR: In password mode, exit status 6 may mean sshpass rejected a previously unseen second-hop host key for $VIA_TARGET:$VIA_PORT." >&2
+        echo "The same status may instead come from the wrapped SSH or remote command." >&2
+        echo "From the first-hop host, verify the second-hop host manually, then retry deployment:" >&2
+        printf '  ssh -p %s %q\n' "$VIA_PORT" "$VIA_TARGET" >&2
+        ;;
+      7)
+        echo "ERROR: In password mode, exit status 7 may mean sshpass detected a changed second-hop host key for $VIA_TARGET:$VIA_PORT." >&2
+        echo "The same status may instead come from the wrapped SSH or remote command." >&2
+        echo "Verify the host identity and the first-hop known_hosts entry manually; known_hosts was not modified automatically." >&2
+        ;;
+    esac
+  fi
+}
 
 cleanup_outer() {
   local status=$?
@@ -826,17 +863,35 @@ cleanup_outer() {
 }
 trap cleanup_outer EXIT
 
-VIA_STAGE_CANDIDATE="$("${via_ssh[@]}" 'umask 077; mktemp -d /tmp/git-delta-deploy.XXXXXX')"
+if VIA_STAGE_CANDIDATE="$("${via_ssh[@]}" 'umask 077; mktemp -d /tmp/git-delta-deploy.XXXXXX')"; then
+  :
+else
+  status=$?
+  report_second_hop_failure "creating the second-hop staging directory" "$status"
+  exit "$status"
+fi
 if [[ ! "$VIA_STAGE_CANDIDATE" =~ ^/tmp/git-delta-deploy\.[[:alnum:]]+$ ]]; then
   echo "ERROR: Second-hop mktemp returned an unexpected staging path: $VIA_STAGE_CANDIDATE" >&2
   exit 1
 fi
 VIA_STAGE="$VIA_STAGE_CANDIDATE"
 
-"${via_scp[@]}" "$OUTER_STAGE/bundle.tgz" \
-  "$OUTER_STAGE/apply.sh" "$VIA_TARGET:$VIA_STAGE/" </dev/null
-"${via_ssh[@]}" \
-  "REMOTE_STAGE=$VIA_STAGE TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash $VIA_STAGE/apply.sh"
+if "${via_scp[@]}" "$OUTER_STAGE/bundle.tgz" \
+    "$OUTER_STAGE/apply.sh" "$VIA_TARGET:$VIA_STAGE/" </dev/null; then
+  :
+else
+  status=$?
+  report_second_hop_failure "copying the bundle and apply script to the second hop" "$status"
+  exit "$status"
+fi
+if "${via_ssh[@]}" \
+    "REMOTE_STAGE=$VIA_STAGE TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash $VIA_STAGE/apply.sh"; then
+  :
+else
+  status=$?
+  report_second_hop_failure "executing the final apply command on the second hop" "$status"
+  exit "$status"
+fi
 VIA_STAGE=""
 OUTER_SCRIPT
 
@@ -846,13 +901,13 @@ OUTER_SCRIPT
       printf 'password\n%s\n' "$GIT_DELTA_DEPLOY_PASSWORD"
       cat "$OUTER_DRIVER"
     } | ssh "$NODE" \
-      "OUTER_STAGE=$REMOTE_STAGE VIA_TARGET_B64=$VIA_TARGET_B64 VIA_PORT=$VIA_PORT TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash -c 'IFS= read -r AUTH_MODE; export AUTH_MODE; IFS= read -r SSHPASS; export SSHPASS; bash -s'"
+      "OUTER_STAGE=$REMOTE_STAGE VIA_TARGET_B64=$VIA_TARGET_B64 VIA_PORT=$VIA_PORT VIA_ACCEPT_NEW_HOST_KEY=$VIA_ACCEPT_NEW_HOST_KEY TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash -c 'IFS= read -r AUTH_MODE; export AUTH_MODE; IFS= read -r SSHPASS; export SSHPASS; bash -s'"
   else
     {
       printf 'normal\n'
       cat "$OUTER_DRIVER"
     } | ssh "$NODE" \
-      "OUTER_STAGE=$REMOTE_STAGE VIA_TARGET_B64=$VIA_TARGET_B64 VIA_PORT=$VIA_PORT TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash -c 'IFS= read -r AUTH_MODE; export AUTH_MODE; unset SSHPASS; bash -s'"
+      "OUTER_STAGE=$REMOTE_STAGE VIA_TARGET_B64=$VIA_TARGET_B64 VIA_PORT=$VIA_PORT VIA_ACCEPT_NEW_HOST_KEY=$VIA_ACCEPT_NEW_HOST_KEY TARGET_DIR_B64=$TARGET_DIR_B64 VERIFY=$VERIFY bash -c 'IFS= read -r AUTH_MODE; export AUTH_MODE; unset SSHPASS; bash -s'"
   fi
 else
   echo "Applying bundle on first-hop target..."

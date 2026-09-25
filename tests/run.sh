@@ -43,6 +43,20 @@ assert_not_contains() {
   fi
 }
 
+assert_occurrences() {
+  local file="$1"
+  local expected="$2"
+  local count="$3"
+  local actual
+  actual="$(grep -oF -- "$expected" "$file" | wc -l)"
+  [[ "$actual" -eq "$count" ]] || {
+    echo "Expected $count occurrences of: $expected" >&2
+    echo "Actual occurrences: $actual" >&2
+    sed -n '1,240p' "$file" >&2
+    fail "occurrence assertion"
+  }
+}
+
 new_repo() {
   local repo="$1"
   mkdir -p "$repo"
@@ -389,6 +403,13 @@ test_transport_control_flow() {
   fi
   assert_contains "$output" 'ERROR: --container-password requires --via-target.'
   [[ ! -s "$log" ]] || fail '--container-password validation invoked an SSH transport command'
+
+  if (cd "$repo" && PATH="$bin:$PATH" TRANSPORT_LOG="$log" OUTER_CAPTURE="$capture" \
+      "$TOOL" --via-accept-new-host-key first@example /srv/app) >"$output" 2>&1; then
+    fail '--via-accept-new-host-key succeeded without --via-target'
+  fi
+  assert_contains "$output" 'ERROR: --via-accept-new-host-key requires --via-target.'
+  [[ ! -s "$log" ]] || fail '--via-accept-new-host-key validation invoked an SSH transport command'
   pass 'direct first-hop flow and second-hop stdin-isolated apply flow'
 }
 
@@ -606,6 +627,11 @@ make_two_hop_local_stubs() {
   mkdir -p "$bin"
   cat > "$bin/ssh" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${TWO_HOP_TRANSPORT_LOG:-}" ]]; then
+  printf 'ssh:' >> "$TWO_HOP_TRANSPORT_LOG"
+  printf ' <%s>' "$@" >> "$TWO_HOP_TRANSPORT_LOG"
+  printf '\n' >> "$TWO_HOP_TRANSPORT_LOG"
+fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n)
@@ -621,14 +647,39 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $# -eq 2 ]] || exit 92
 shift
+if [[ "${SECOND_HOP_FAIL_PHASE:-}" == apply && "$1" == *'bash /tmp/git-delta-deploy.'*'/apply.sh'* ]]; then
+  echo 'mock final apply stderr' >&2
+  exit "${SECOND_HOP_FAIL_STATUS:-6}"
+fi
 bash -c "$1"
 EOF
   chmod +x "$bin/ssh"
+  cat > "$bin/sshpass" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == -e ]] || exit 94
+shift
+if [[ "${SECOND_HOP_FAIL_PHASE:-}" == staging && "$*" == *'mktemp -d /tmp/git-delta-deploy.XXXXXX'* ]]; then
+  echo 'mock second-hop ssh stderr' >&2
+  exit "${SECOND_HOP_FAIL_STATUS:-6}"
+fi
+exec "$@"
+EOF
+  chmod +x "$bin/sshpass"
   cat > "$bin/scp" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${TWO_HOP_TRANSPORT_LOG:-}" ]]; then
+  printf 'scp:' >> "$TWO_HOP_TRANSPORT_LOG"
+  printf ' <%s>' "$@" >> "$TWO_HOP_TRANSPORT_LOG"
+  printf '\n' >> "$TWO_HOP_TRANSPORT_LOG"
+fi
+second_hop=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -P|-o)
+    -P)
+      second_hop=1
+      shift 2
+      ;;
+    -o)
       shift 2
       ;;
     *)
@@ -636,6 +687,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+if [[ "$second_hop" -eq 1 && "${SECOND_HOP_FAIL_PHASE:-}" == copy ]]; then
+  echo 'mock second-hop scp stderr' >&2
+  exit "${SECOND_HOP_FAIL_STATUS:-42}"
+fi
 [[ $# -ge 2 ]] || exit 93
 destination="${!#}"
 target_dir="${destination#*:}"
@@ -669,6 +724,128 @@ test_local_second_hop_apply() {
   [[ -f "$backup" ]] || fail 'second-hop backup was not retained'
   rm -f -- "$backup"
   pass 'second-hop driver executes inner apply without consuming outer stdin'
+}
+
+test_second_hop_accept_new_host_key() {
+  local repo="$TEST_ROOT/two-hop-host-key"
+  local target="$TEST_ROOT/two-hop-host-key-target"
+  local output="$TEST_ROOT/two-hop-host-key.out"
+  local log="$TEST_ROOT/two-hop-host-key.log"
+  local bin="$TEST_ROOT/two-hop-host-key-bin"
+  local backup
+  local secret='accept new secret value'
+  new_repo "$repo"
+  mkdir -p "$target"
+  cp "$repo/changed.txt" "$target/changed.txt"
+  printf 'host key policy\n' > "$repo/changed.txt"
+  make_two_hop_local_stubs "$bin"
+
+  : > "$log"
+  (cd "$repo" && PATH="$bin:$PATH" TWO_HOP_TRANSPORT_LOG="$log" \
+    "$TOOL" --via-target second-hop --via-port 2222 first-hop "$target") >"$output" 2>&1
+  assert_not_contains "$log" 'StrictHostKeyChecking=accept-new'
+  backup="$(sed -n 's/^Backup: //p' "$output")"
+  [[ -f "$backup" ]] || fail 'default host-key policy deployment did not retain a backup'
+  rm -f -- "$backup"
+
+  : > "$log"
+  (cd "$repo" && PATH="$bin:$PATH" TWO_HOP_TRANSPORT_LOG="$log" \
+    "$TOOL" --via-target second-hop --via-port 2222 \
+      --via-accept-new-host-key --container-password "$secret" \
+      first-hop "$target") >"$output" 2>&1
+  assert_contains "$log" 'ssh: <-n> <-p> <2222> <-o> <StrictHostKeyChecking=accept-new> <second-hop>'
+  assert_contains "$log" 'scp: <-P> <2222> <-o> <StrictHostKeyChecking=accept-new>'
+  assert_occurrences "$log" '<StrictHostKeyChecking=accept-new>' 3
+  assert_contains "$log" 'ssh: <first-hop> <umask 077; mktemp -d /tmp/git-delta-deploy.XXXXXX>'
+  assert_contains "$log" 'scp: <'
+  assert_not_contains "$output" "$secret"
+  assert_not_contains "$log" "$secret"
+  backup="$(sed -n 's/^Backup: //p' "$output")"
+  [[ -f "$backup" ]] || fail 'accept-new host-key deployment did not retain a backup'
+  rm -f -- "$backup"
+
+  pass 'second-hop accept-new host-key policy is opt-in and leaves first-hop transport unchanged'
+}
+
+test_second_hop_transport_diagnostics() {
+  local repo="$TEST_ROOT/two-hop-failures"
+  local output="$TEST_ROOT/two-hop-failures.out"
+  local bin="$TEST_ROOT/two-hop-failures-bin"
+  local status
+  local secret='second hop secret value'
+  new_repo "$repo"
+  printf 'changed\n' >> "$repo/changed.txt"
+  make_two_hop_local_stubs "$bin"
+
+  if (cd "$repo" && PATH="$bin:$PATH" \
+      SECOND_HOP_FAIL_PHASE=staging SECOND_HOP_FAIL_STATUS=6 \
+      "$TOOL" --via-target root@localhost --via-port 2222 \
+        --container-password "$secret" first-hop /srv/app) >"$output" 2>&1; then
+    fail 'unknown second-hop host key unexpectedly succeeded'
+  else
+    status=$?
+  fi
+  [[ "$status" -ne 0 ]] || fail 'unknown second-hop host key returned zero'
+  assert_contains "$output" 'mock second-hop ssh stderr'
+  assert_contains "$output" 'Second-hop transport failed while creating the second-hop staging directory (exit status 6).'
+  assert_contains "$output" 'exit status 6 may mean sshpass rejected a previously unseen second-hop host key for root@localhost:2222.'
+  assert_contains "$output" 'The same status may instead come from the wrapped SSH or remote command.'
+  assert_not_contains "$output" 'Second-hop SSH host key is not trusted'
+  assert_contains "$output" 'ssh -p 2222 root@localhost'
+  assert_not_contains "$output" "$secret"
+  assert_not_contains "$output" 'Deployment and verification completed successfully.'
+
+  if (cd "$repo" && PATH="$bin:$PATH" \
+      SECOND_HOP_FAIL_PHASE=staging SECOND_HOP_FAIL_STATUS=7 \
+      "$TOOL" --via-target root@localhost --via-port 2222 \
+        --via-accept-new-host-key \
+        --container-password "$secret" first-hop /srv/app) >"$output" 2>&1; then
+    fail 'changed second-hop host key unexpectedly succeeded'
+  else
+    status=$?
+  fi
+  [[ "$status" -ne 0 ]] || fail 'changed second-hop host key returned zero'
+  assert_contains "$output" 'Second-hop transport failed while creating the second-hop staging directory (exit status 7).'
+  assert_contains "$output" 'exit status 7 may mean sshpass detected a changed second-hop host key for root@localhost:2222.'
+  assert_contains "$output" 'The same status may instead come from the wrapped SSH or remote command.'
+  assert_not_contains "$output" 'Second-hop SSH host key changed'
+  assert_contains "$output" 'known_hosts was not modified automatically.'
+  assert_not_contains "$output" "$secret"
+  assert_not_contains "$output" 'Deployment and verification completed successfully.'
+
+  for status in 6 7; do
+    if (cd "$repo" && PATH="$bin:$PATH" \
+        SECOND_HOP_FAIL_PHASE=apply SECOND_HOP_FAIL_STATUS="$status" \
+        "$TOOL" --via-target root@localhost --via-port 2222 \
+          --container-password "$secret" first-hop /srv/app) >"$output" 2>&1; then
+      fail "second-hop final apply exit $status unexpectedly succeeded"
+    else
+      [[ "$?" -eq "$status" ]] || fail "second-hop final apply did not preserve exit $status"
+    fi
+    assert_contains "$output" 'mock final apply stderr'
+    assert_contains "$output" "Second-hop transport failed while executing the final apply command on the second hop (exit status $status)."
+    assert_contains "$output" "exit status $status may mean sshpass"
+    assert_contains "$output" 'The same status may instead come from the wrapped SSH or remote command.'
+    assert_not_contains "$output" 'Second-hop SSH host key is not trusted'
+    assert_not_contains "$output" 'Second-hop SSH host key changed'
+    assert_not_contains "$output" "$secret"
+    assert_not_contains "$output" 'Deployment and verification completed successfully.'
+  done
+
+  if (cd "$repo" && PATH="$bin:$PATH" \
+      SECOND_HOP_FAIL_PHASE=copy SECOND_HOP_FAIL_STATUS=42 \
+      "$TOOL" --via-target second-hop --via-port 2222 \
+        first-hop /srv/app) >"$output" 2>&1; then
+    fail 'second-hop copy failure unexpectedly succeeded'
+  else
+    status=$?
+  fi
+  [[ "$status" -ne 0 ]] || fail 'second-hop copy failure returned zero'
+  assert_contains "$output" 'mock second-hop scp stderr'
+  assert_contains "$output" 'Second-hop transport failed while copying the bundle and apply script to the second hop (exit status 42).'
+  assert_not_contains "$output" 'Deployment and verification completed successfully.'
+
+  pass 'second-hop transport failures report conditional host-key guidance, phase, status, and existing stderr'
 }
 
 test_path_confinement() {
@@ -715,6 +892,8 @@ test_transport_control_flow
 test_dry_run_has_no_transport
 test_local_apply_backup_and_verification
 test_local_second_hop_apply
+test_second_hop_accept_new_host_key
+test_second_hop_transport_diagnostics
 test_path_confinement
 test_symlink_deployment_and_verification
 test_final_path_symlink_deletion

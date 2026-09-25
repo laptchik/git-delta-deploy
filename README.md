@@ -113,6 +113,22 @@ git-delta-deploy \
   /opt/application
 ```
 
+Use `--via-accept-new-host-key` to explicitly opt in to passing OpenSSH's
+`StrictHostKeyChecking=accept-new` to second-hop `ssh` and `scp` only. The flag
+requires `--via-target`. It allows previously unseen second-hop host keys to be
+accepted and stored automatically, while changed known host keys are still
+rejected; it does not disable host-key verification. Without the flag, normal
+SSH host-key checking remains unchanged.
+
+```bash
+git-delta-deploy \
+  --via-target root@localhost \
+  --via-port 2222 \
+  --via-accept-new-host-key \
+  remote-host.example \
+  /opt/application
+```
+
 When that container's nested SSH server uses a password, pass it directly:
 
 ```bash
